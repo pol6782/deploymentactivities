@@ -1,0 +1,294 @@
+#!/bin/bash -
+# script requires copied the local-host’s public key to the remote-host’s authorized_keys file
+# each environment has protected private key, which should be decrypted on first login after system shutdown (ssh-agent is working as daemon)
+# script should be started from one of available primary nodes (CRM, BSS, DPS, TUM, BPC)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="23.05.2017r."
+SCRIPT_VERSION="0.0.11"
+
+CONTACT_LIST='adam.chalat@comarch.com' # list of direct contact persons 
+
+source ~/bin/location_finder
+
+[[ `grep ^PROTECTED_ENVIRONMENTS ~/bin/servers.arr | grep ${SHOW_ENV_NAME}` ]] && PROTECT='TRUE' || PROTECT='FALSE' # check if environment is declared in PROTECTED_ENVIRONMENTS list
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nApplications control tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [task]: start, stop, restart, status"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [task] [environment] [passphrase]")\n"
+	echo -e "$(colored "33" "INFORMATION") In urgent cases please contact Comarch ITOPS department: ${CONTACT_LIST}\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#--------------------- PARAMETERS AND VARIABLES ---------------------#
+#--------------------------------------------------------------------#
+
+JOB=${1,,}
+ENV_NAME=${2^^}
+PASSPHRASE=$3
+PARENT_PID=$$
+
+SECONDS=0 # count the amount of time during task execution
+PROCESS_INFO=$(ps -fp ${PARENT_PID} | awk 'NR==2 {print}') # informations about parent PID (do not confuse with PPID)
+PROCESS_INFO+=" `whoami`@${IP_ADDRESS}"
+
+#--------------------------------------------------------------------#
+#------------------------- PRECONDITIONS ----------------------------#
+#--------------------------------------------------------------------#
+
+# check if user links to proper environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ WARNING ]") Current environment: ${SHOW_ENV_NAME,,}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- READ ARRAY ------------------------------#
+#--------------------------------------------------------------------#
+
+# search for declared ENV_LIST key and list entries starting only with with definied prefixes and having also only seven columns
+# matrix is pre-sorted for the current environment
+# additionaly requirements: list only main nodes, which belong to the set of declared environment types
+readarray DEDICATED_ARRAY <<< "$(for SORT_ENV in `awk '$1 == "ENV_LIST" { print }' ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | tr ',' ' '`; do
+	awk -v env_name="${SORT_ENV}" '$1 == env_name { print }' ~/bin/servers.arr | awk '(NF==7)' | grep ^${SHOW_ENV_NAME} | awk '$2 ~ /CPM|CRM|BPC|TUM|DPS|AIF/ {print}' | sort -k2; done)"
+
+# environment array containing only unique IP addresses
+readarray UNIQUE_ADDRESSES_ARRAY <<< "$(for SORT_ENV in `awk '$1 == "ENV_LIST" { print }' ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | tr ',' ' '`; do
+	awk -v env_name="${SORT_ENV}" '$1 == env_name { print }' ~/bin/servers.arr | awk '(NF==7)' | grep ^${SHOW_ENV_NAME} | awk '{print $3}' | sort -V | uniq; done)"
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function gather_app_info() {
+	if [[ ${CODE} -ne 0 ]]; then 
+		echo -e "$(colored "31" "[ ERROR ]") ${APPLICATION_TYPE^^} application is not working correctly (restart is required)"
+
+		[[ "${FUNCNAME[1]}" == 'application_launch_ssh' ]] && \
+		ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc '${SCRIPT_NAME} all restart ${SHOW_ENV_NAME} current'" 2>&1 || \
+		${SCRIPT_NAME} all restart ${SHOW_ENV_NAME} current
+	else
+		echo -e "$(colored "32" "[ PASSED ]") ${APPLICATION_TYPE^^} application is working correctly (skipping launch process)"
+		
+		[[ "${FUNCNAME[1]}" == 'application_launch_ssh' ]] && \
+		ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc '${SCRIPT_NAME} all status ${SHOW_ENV_NAME^^} current'" || \
+		${SCRIPT_NAME} all status ${SHOW_ENV_NAME} current
+	fi
+}
+
+function application_launch() {
+	[[ ${PROTECT} == 'TRUE' ]] && { cat ~/bin/${SCRIPT_NAME}.enc | openssl aes-128-cbc -a -d -salt -pass file:"/tmp/.decode" > ~/bin/${SCRIPT_NAME}; chmod 700 ~/bin/${SCRIPT_NAME}; }
+
+	# if 'start' task is chosen check application status, otherwise proceed without any checkout
+	[[ ${JOB} == 'start' ]] && \
+	{ APPLICATION_STATUS=$(${SCRIPT_NAME} all status ${SHOW_ENV_NAME} current &>/dev/null); CODE=$?; gather_app_info; } || \
+	${SCRIPT_NAME} all ${JOB} ${SHOW_ENV_NAME} current
+	return $? # return script execution status (errors handling)
+}
+
+function application_launch_ssh() {
+	SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${NODE_USER}@${HOST} echo confirmed 2>&1)
+	if [[ $SSH_STATUS == 'confirmed' ]] ; then
+		[[ ${PROTECT} == 'TRUE' ]] && {
+			ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc 'cat ~/bin/.decode.enc | openssl aes-128-cbc -a -d -salt -k ${PASSPHRASE} > /tmp/.decode 2>/dev/null'"
+			ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc 'cat ~/bin/${SCRIPT_NAME}.enc | openssl aes-128-cbc -a -d -salt -pass file:"/tmp/.decode" > ~/bin/${SCRIPT_NAME}; chmod 700 ~/bin/${SCRIPT_NAME}'"
+		}
+
+		[[ ${JOB} == 'start' ]] && \
+		{ APPLICATION_STATUS=$(ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc '${SCRIPT_NAME} all status ${SHOW_ENV_NAME^^} current'" &>/dev/null); CODE=$?; gather_app_info; } || \
+		ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc '${SCRIPT_NAME} all ${JOB} ${SHOW_ENV_NAME} current'" 2>&1
+	else
+		echo -e "$(colored "31" "[ ERROR ]") SSH connection to remote host: ${NODE_USER}@${HOST} is denied (please exchange RSA keys)"
+	fi
+	return $? # return script execution status (errors handling)
+}
+
+function check_semaphore_process() {
+	# check which node gained last exclusive access (remote host or localhost)
+	if [[ `whoami`@${IP_ADDRESS} != ${PARENT_ORIGIN} ]]; then
+		SSH_EXCLUSIVE_ACCESS=$(ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c 'awk "'"{print \$2}"'" 2>/dev/null < ${RHOME}/bin/startup.pid'")
+		echo "Searching for previously launched ${SSH_EXCLUSIVE_ACCESS} PID process executed from ${PARENT_ORIGIN}"
+		ssh -qo BatchMode=yes ${PARENT_ORIGIN} "bash -l -c 'ps -p ${SSH_EXCLUSIVE_ACCESS} &>/dev/null'"
+	else
+		([[ ${NODE_USER} == ${USER} ]] && [[ ${MACHINE_IP} == ${IP_ADDRESS} ]]) && \
+		EXCLUSIVE_ACCESS_PID=$(awk '{print $2}' 2>/dev/null < ~/bin/startup.pid) || \
+		EXCLUSIVE_ACCESS_PID=$(ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c 'awk "'"{print \$2}"'" 2>/dev/null < ${RHOME}/bin/startup.pid'")
+		echo "Searching for previously launched ${EXCLUSIVE_ACCESS_PID} PID process executed from ${PARENT_ORIGIN}"
+		ps -p ${EXCLUSIVE_ACCESS_PID} &>/dev/null
+	fi
+
+	return $? # return presence of previous process
+}
+
+function clear_environments() {
+	# remove all decoded scripts if environment is protected
+	echo -e "\n$(colored "33" "INFORMATION") Cleaning decrypted scripts and semaphore files"
+	for SERVER in "${DEDICATED_ARRAY[@]}"; do
+		SERV=($SERVER)
+		HOST="${SERV[2]}"; NODE_USER="${SERV[4]}"; MACHINE_IP="${SERV[6]}"
+
+		if [[ ${NODE_USER} == ${USER} ]] && [[ ${MACHINE_IP} == ${IP_ADDRESS} ]]; then
+			[[ ${PROTECT} == 'TRUE' ]] && find ~/bin -maxdepth 1 -type f -name "*_manage" -exec rm -f {} \; # remove decrypted management scripts
+			[[ ${PARENT_PID} -eq `awk '{print $2}' 2>/dev/null < ~/bin/startup.pid` ]] && rm -f ~/bin/startup.pid &>/dev/null # remove semaphore file only if belongs to owner
+			rm -f /tmp/.decode &>/dev/null # remove passphrase
+		else
+			[[ ${PROTECT} == 'TRUE' ]] && ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -lc 'find ~/bin -maxdepth 1 -type f -name \"*_manage\" -exec rm {} \;'" &>/dev/null < /dev/null
+			ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c '([[ ${PARENT_PID} -eq \$(awk "'"{print \$2}"'" < ~/bin/startup.pid) ]] || [[ -z \$(awk "'"{print \$2}"'" < ~/bin/startup.pid) ]]) \
+			&& rm -f ~/bin/startup.pid; rm -f /tmp/.decode'" &>/dev/null < /dev/null
+		fi
+	done
+	echo "Applications administration process finished after ${SECONDS} seconds at `date +'%Y.%m.%d (time %H:%M:%S)'`"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+trap 'clear_environments' EXIT SIGINT # remove encrypted file on exit
+
+echo "Invoking the applications administration process at `date +'%Y.%m.%d (time %H:%M:%S)'`"
+echo "Process information: ${PARENT_PID} PID launched from `whoami`@${IP_ADDRESS}"
+
+# try entered passphrase to decode password for encrypted management scripts
+# cat <filename> | openssl aes-128-cbc -a -salt -k <passphrase> > <filename>.enc
+cat ${HOME}/bin/.decode.enc | openssl aes-128-cbc -a -d -salt -k ${PASSPHRASE} > /tmp/.decode 2>/dev/null
+[[ $? -ne 0 ]] && { echo -e "\n$(colored "31" "[ WARNING ]") Entered passphrase is incorrect. Please contact Comarch ITOPS department: ${CONTACT_LIST}"; exit 1; }
+
+# generate unique nodes list and check environment availability
+echo -e "\n$(colored "33" "INFORMATION") Checking availability of ${ENV_NAME} nodes\n"
+for PING_HOST_ADDRESS in ${UNIQUE_ADDRESSES_ARRAY[@]}; do
+	COUNTER=10
+	while [[ ${COUNTER} -ne 0 ]]; do
+		PING_HOST=$(ping -c2 -w5 ${PING_HOST_ADDRESS}); PING_CODE=$? # specify: packets count and timeout
+		[[ ${PING_CODE} -eq 0 ]] && { echo -e "$(colored "32" "[ PASSED ]") Host ${PING_HOST_ADDRESS} is responding"; COUNTER=1; }
+		((COUNTER = COUNTER - 1)) 
+	done
+
+	if [[ ${PING_CODE} -ne 0 ]]; then 
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Host ${PING_HOST_ADDRESS} is not responding"
+		echo -e "$(colored "31" "[ CRITICAL ERROR ]") Processing environment's matrix modification - removing broken IP address"
+		DEDICATED_ARRAY=$(echo "${DEDICATED_ARRAY[@]}" | sed "/${PING_HOST_ADDRESS}/d")
+	fi
+done
+
+# check connection to all remote host within the environment
+# remember, that ssh command breaks loop (null input is required)
+TEMP_DEDICATED_ARRAY="${DEDICATED_ARRAY[@]}" # temporary matrix to store entries after verification
+echo -e "\n$(colored "33" "INFORMATION") Checking connection to remote hosts within ${ENV_NAME} environment"
+
+for SSH_CONNECTION in "${DEDICATED_ARRAY[@]}"; do
+	SERV=($SSH_CONNECTION); ERROR=0
+	HOST="${SERV[2]}"; NODE_USER="${SERV[4]}"; RHOME="${SERV[5]}"; MACHINE_IP="${SERV[6]}"
+
+	echo -e "\n$(colored "34" "[ INFORMATION ]") Processing verification of ${NODE_USER}@${HOST} host"
+	# exclude localhost from SSH verification
+	if [[ ${NODE_USER} == ${USER} ]] && [[ ${MACHINE_IP} == ${IP_ADDRESS} ]]; then
+		echo "Detected, that ${USER}@${IP_ADDRESS} is localhost"
+		if [[ ! -f ~/bin/startup.pid ]]; then
+			echo "Lock of ${USER}@${IP_ADDRESS} host was successfully performed"
+			echo ${PROCESS_INFO} > ~/bin/startup.pid
+		else
+			PARENT_ORIGIN=$(awk '{print $NF}' <<< ${PROCESS_INFO}) # latest column represents parent node, which gained exclusive access during last boot
+			check_semaphore_process
+			if [[ $? -eq 0 ]]; then
+				echo -e "Exclusive access to ${USER}@${IP_ADDRESS} host was impossible, because process with $(awk '{print $2}' 2>/dev/null < ~/bin/startup.pid) PID is already running"
+				ERROR=1; LOCAL_MATRIX=($SSH_CONNECTION)
+			else
+				echo -e "PID written to ~/bin/startup.pid file does not exist in running processes on induction node"
+				echo -e "Overwriting semaphore file with ${PARENT_PID} PID. Lock of ${USER}@${IP_ADDRESS} host was successfully performed"
+				echo ${PROCESS_INFO} > ~/bin/startup.pid
+			fi
+		fi
+	else
+		SSH_STATUS=$(ssh -o BatchMode=yes -o ConnectTimeout=5 ${NODE_USER}@${HOST} echo confirmed 2>&1 < /dev/null)
+		if [[ ! ${SSH_STATUS} =~ 'confirmed' ]]; then
+			echo -e "Remote connection to ${NODE_USER}@${HOST} host is broken."
+			ERROR=1
+		else
+			echo -e "Remote connection to ${NODE_USER}@${HOST} host is open"
+			RESULT=$(ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c '[[ -f ${RHOME}/bin/startup.pid ]]'" 2>&1 < /dev/null)
+			if [[ $? -ne 0 ]]; then
+				ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c 'echo ${PROCESS_INFO} > ${RHOME}/bin/startup.pid'" 2>&1 < /dev/null
+				echo "Lock of ${NODE_USER}@${HOST} host was successfully performed"
+			else
+				# latest column represents parent node, which gained exclusive access during last boot
+				PARENT_ORIGIN=$(ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c 'awk "'"{print \$NF}"'" 2>/dev/null < ${RHOME}/bin/startup.pid'")
+				check_semaphore_process
+				if [[ $? -eq 0 ]]; then
+					echo -e "Exclusive access to ${NODE_USER}@${HOST} host was impossible, because process with ${EXCLUSIVE_ACCESS_PID} PID is already running"
+					ERROR=1
+				else
+					echo -e "PID written to ~/bin/startup.pid file does not exist in running processes on induction node"
+					echo -e "Overwriting semaphore file with ${PARENT_PID} PID. Lock of ${NODE_USER}@${HOST} host was successfully performed"
+					ssh -qo BatchMode=yes ${NODE_USER}@${HOST} "bash -l -c 'echo ${PROCESS_INFO} > ${RHOME}/bin/startup.pid'" 2>&1 < /dev/null
+				fi
+			fi
+		fi
+	fi
+
+	if [[ ${ERROR} -ne 0 ]]; then
+		echo "Processing environment's matrix modification - removing broken IP address"
+		TEMP_DEDICATED_ARRAY=$(echo "${TEMP_DEDICATED_ARRAY[@]}" | sed "/${NODE_USER}.*${HOST}/d")
+		echo -e "$(colored "31" "[ FAILED ]") Verification of ${NODE_USER}@${HOST} host finished with errors"
+	else
+		echo -e "$(colored "32" "[ PASSED ]") Verification of ${NODE_USER}@${HOST} host completed successfully"
+	fi
+done
+
+# overwrite environment matrix after SSH verification (if parameter is null or unset use word)
+TEMP_DEDICATED_ARRAY="${TEMP_DEDICATED_ARRAY:=${LOCAL_MATRIX[@]}}"
+readarray VERYFIED_DEDICATED_ARRAY <<< "${TEMP_DEDICATED_ARRAY}"
+
+echo -e "\n$(colored "33" "INFORMATION") Environment matrix after verification\n"
+echo "${VERYFIED_DEDICATED_ARRAY[@]}" | sed 's|^[[:blank:]]*||g' | sed '/^$/d' # remove empty lines and charactera at the beginning of line
+
+# list declaration: application prefix and node type, where command should be executed
+# zookeeper launch is disabled for safety reasons (may cause unnecessary changes propagation)
+for COMPONENT in rmq:CPM:2 es:CPM:2 bss:CPM:2 crm:CRM:2 tum:TUM:2 aif:AIF:2 dps:DPS:1 bpc:BPC:2; do
+	# 'APPLICATION_TYPE' - prefix for management script, 'BREAK_NUMBER' - break loop after X iterations, 'APPLICATION_NODE_TYPE' - node type (username does not guarantee uniqueness), 'SCRIPT_NAME' - full management script name
+	APPLICATION_TYPE="${COMPONENT%%:*}"; SCRIPT_NAME="${APPLICATION_TYPE}_manage"; BREAK_NUMBER=${COMPONENT##*:}; APPLICATION_NODE_TEMP="${COMPONENT%:*}"; APPLICATION_NODE_TYPE="${APPLICATION_NODE_TEMP#*:}"
+	for SERVER in "${VERYFIED_DEDICATED_ARRAY[@]}"; do
+		SERV=($SERVER)
+		if [[ ${SERV[1]} == ${APPLICATION_NODE_TYPE} ]]; then
+			HOST="${SERV[2]}"; NODE_USER="${SERV[4]}"; ((BREAK_NUMBER = BREAK_NUMBER - 1)) 
+
+			# run command directly on current node or execute over ssh
+			echo -e "\n$(colored "33" "INFORMATION") Executing command on ${NODE_USER}@${HOST}"
+			if [[ "${SHOW_ENV_TYPE}" == "${SERV[1]}" ]] && [[ ${NODE_USER} == "${SERV[4]}" ]] && [[ "${IP_ADDRESS}" = "${SERV[6]}" ]]; then
+				application_launch
+			else
+				application_launch_ssh
+			fi
+			if [[ $? -ne 0 ]] && [[ ${JOB} =~ ^(stop|start|restart)$ ]]; then
+				echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Some errors occured during execution command: ${SCRIPT_NAME} all ${JOB} ${SHOW_ENV_NAME}"
+				echo -e "$(colored "31" "[ CRITICAL ERROR ]") Please contact Comarch ITOPS department: ${CONTACT_LIST}"
+				exit 1
+			fi
+			[[ ${BREAK_NUMBER} -eq 0 ]] && break
+		fi
+	done
+done

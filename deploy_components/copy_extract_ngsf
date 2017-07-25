@@ -1,0 +1,113 @@
+#!/bin/bash -
+# NGSF upgrade tool by janusz.ferenc@comarch.com and adam.chalat@comarch.com
+# build_date=07.10.2016
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="NGSF_Upgrade_Binaries"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep ^"${ENV}" ${BIN_PATH}/servers.arr | grep NGSF | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+REMOTE_NGSF_DIR=bin/NGSFMigrationTool
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function ngsf_stop() {
+    fLog "Stopping NGSF"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/TELIA; ./run_subsystems.sh stop"
+}
+
+function copy_binaries_to_server() {
+    fLog "NGSF binaries copy"
+    fLog "Files: ${NGSF_BINARIES}"
+    fLog "Destination directory: ${RHOME}"
+    RESULT=$(scp -pq ${VERSION_DIR}/${NGSF_BINARIES} ${USER}@${HOST}:${RHOME} 2>&1)
+    CODE=$?; check_errors
+    fLog "NGSF binaries copied successfully"
+    run_remote_command ${SERV[2]} "cd ${RHOME}; tar -xvf ${NGSF_BINARIES}"
+}
+
+function ngsf_bpm_import() {
+    fLog "NGSF BPM import"
+    run_remote_command ${SERV[2]} "mv -v ${RHOME}/NGSF_BPM_Definitions.zip ~/bin/NGSFMigrationTool/"
+    run_remote_command ${SERV[2]} "cd ~/bin/NGSFMigrationTool/; ./import NGSF_BPM_Definitions.zip"
+}
+
+function ngsf_unzip() {
+    fLog "Backuping NGSF binaries"
+    run_remote_command ${SERV[2]} "cd ${RHOME}; mv TELIA_HEAD backup/TELIA_HEAD_`date +%y%m%d_%H%M`"
+    fLog "NGSF binaries backup completed successfully"
+
+    fLog "Unzipping new NGSF binaries"
+    run_remote_command ${SERV[2]} "cd ${RHOME}; unzip TELIA_HEAD.zip"
+}
+
+function ngsf_configure() {
+    fLog "Configuring NGSF"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/TELIA_HEAD/ConfigTool/run; ./ConfigTool.sh -configure \${HOSTNAME%%.*}_global_config.xml; ./ConfigTool.sh -clean \${HOSTNAME%%.*}_global_config.xml"
+}
+
+
+function ngsf_db_upgrade() {
+    fLog "Upgrading NGSF Database"
+    run_remote_command ${SERV[2]} "cd ~/bin/db_upgrade; ./db_upgrade.sh ${RHOME}/TELIA_HEAD"
+}
+
+function ngsf_test_endpoints() {
+    fLog "Testing NGSF endpoints"
+    run_remote_command ${SERV[2]} "curl http://$HOST:25370/ngsf-adapter/RTServiceOrder?wsdl"
+    run_remote_command ${SERV[2]} "curl http://$HOST:25370/ngsf-adapter/ServiceFulfillment/ServiceFulfillmentAdapter?wsdl"
+    fLog "RTServiceOrder and ServiceFulfillmentAdapter tested."
+    run_remote_command ${SERV[2]} "cd ${RHOME}/TELIA; cat layer.properties | head -n10"
+}
+
+function ngsf_start() {
+    fLog "Starting NGSF"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/TELIA; ./run_subsystems.sh forcestart"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "NGSF" ]]; then
+        USER="${SERV[4]}"; HOST="${SERV[2]}"
+
+        NGSF_BINARIES=`find ${VERSION_DIR} -name "*NGSF.tar" -type f -exec basename {} \;`
+        ngsf_stop
+        copy_binaries_to_server
+        ngsf_bpm_import
+        ngsf_unzip
+        ngsf_configure
+        ngsf_db_upgrade
+        ngsf_test_endpoints
+        ngsf_start
+    fi
+done
+
+source ${BIN_PATH}/common_after

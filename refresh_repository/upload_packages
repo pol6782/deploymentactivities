@@ -1,0 +1,202 @@
+#!/bin/bash -
+# package delivery tool by adam.chalat@comarch.com
+# script requires to work properly external file releases.arr
+# sorting file may cause problems with function COPY_2_MFT
+# remember to add case if new client is added - section 'PROGRAM CALL' (recognized by prefix in name)
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="14.07.2017r."
+SCRIPT_VERSION="0.1.9"
+
+#--------------------------------------------------------------------#
+#--------------------------- VARIABLES ------------------------------#
+#--------------------------------------------------------------------#
+
+RELEASE=${1^^}
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ "$1" = "help" ] || [ $# -eq 0 ]; then
+    echo -e "\nPackage delivery tool by \e[32madam.chalat@comarch.com\e[0m"
+    echo -e "Version: \e[35m${SCRIPT_VERSION}\e[0m | Last modification: \e[35m${BUILD_DATE}\e[0m\n"
+    echo "This script requires below parameters:"
+    echo -e "Available parameter [release]: `grep ^ENV_LIST ~/bin/releases.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | sed 's| |, |g'`\n"
+    echo -e "Usage: \e[36mupload_packages [release]\e[0m\n"
+    exit 1
+elif [[ -z `grep ^ENV_LIST ~/bin/releases.arr | grep ${RELEASE}` ]]; then
+    echo -e "\n\e[31m[ WARNING ]\e[0m Wrong parameter. Please see below."
+    echo -e "\e[31m[ WARNING ]\e[0m Available parameters [release]: `grep ^ENV_LIST ~/bin/releases.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}' | sed 's| |, |g'`\n"
+    exit 1
+fi
+
+#--------------------------------------------------------------------#
+#---------------------- PATHS AND VARIABLES -------------------------#
+#--------------------------------------------------------------------#
+
+ROOM_ID=`grep ^${RELEASE} ~/bin/releases.arr | cut -d' ' -f2` # room name for Slack application
+REMOTE_ADDRESS=`grep ^${RELEASE} ~/bin/releases.arr | cut -d' ' -f3` # define, where release should be send
+SOFTLINK=`grep ^${RELEASE} ~/bin/releases.arr | cut -d' ' -f4` # softlink for packages collection
+current_md5sum=`grep ^${RELEASE} ~/bin/releases.arr | cut -d' ' -f5` # suffix for output logs
+REMOTE_USER=`grep ^${RELEASE} ~/bin/releases.arr | cut -d' ' -f6` # additional parameters defining user
+REMOTE_DIRECTORY=`grep ^${RELEASE} ~/bin/releases.arr | cut -d' ' -f7` # additional parameters defining path
+
+default_path=/home/luntbuild/crm_releases
+source_dir=${default_path}/${SOFTLINK}
+mft_dir=${default_path}/mft
+log_dir=${default_path}/mft/logs
+
+lreadlink=$(readlink -f ${source_dir})
+log_file="c2m_${RELEASE}_`date +\%Y\%m\%d`.log"
+
+#--------------------------------------------------------------------#
+#-------------------------- FUNCTIONS -------------------------------#
+#--------------------------------------------------------------------#
+
+function send_to_slack() {
+    AUTH_TOKEN=`grep ^SLACK_CREDENTIALS ~/bin/releases.arr | awk '{print $2}'` # Slack webhook (AUTH_TOKEN)
+    POSIX_TIME=`date +%s` # timestamp
+
+    curl -X POST --data '{
+        "channel":"'"#${ROOM_ID}"'", "username":"Repository Supervisor",
+        "attachments": [{"fallback":"Upload release to repository","pretext":"'"Repository synchronization - ${release} release upload process"'",
+        "mrkdwn":"true", "color":"'"${COLOUR}"'", "title":"'"${TITLE}"'", "footer":"Administrator contact: adam.chalat@comarch.com",
+        "footer_icon":"https://platform.slack-edge.com/img/default_application_icon.png", "ts":"'"${POSIX_TIME}"'"}]
+    }' -i ${AUTH_TOKEN}
+}
+
+function COPY_2_MFT() {
+    sftp TUS-FIN-CBS-MBL@62.71.178.7 << EOT
+lcd ${mft_dir}
+cd /FINEITCBSISCBLMBL01
+mput ${release}*
+EOT
+    
+    mft_code=$?
+}
+
+#--------------------------------------------------------------------#
+#--------------------- INITIAL PREREQUISITES ------------------------#
+#--------------------------------------------------------------------#
+
+if [[ -f ${mft_dir}/${RELEASE}.lock ]]; then
+    echo -e "\nCurrent timestamp: `date +"%Y-%m-%d %H:%M"`" >> ${log_dir}/${log_file} 2>&1
+    echo "Repositories synchronistaion is suspended due to errors (manual interference is required)" >> ${log_dir}/${log_file} 2>&1
+    echo "Lock ${mft_dir}/${RELEASE}.lock has to be removed manually to restore upload process" >> ${log_dir}/${log_file} 2>&1
+    exit 1
+else
+    for COMPONENT in 'bpc-loader' 'bss-backend' 'bss-frontend' 'tum-restapi' '-CRM-' 'DPS-' 'crm-cqrs'; do
+        if [[ `find ${lreadlink} -name "*$COMPONENT*" | wc -l` -gt 1 ]]; then
+            echo -e "\nCurrent timestamp: `date +"%Y-%m-%d %H:%M"`" >> ${log_dir}/${log_file} 2>&1
+            echo "Release `basename ${lreadlink}` is corrupted - manual interference is required (duplicated components)" >> ${log_dir}/${log_file} 2>&1
+            TITLE="Release `basename ${lreadlink}` is corrupted - duplicated components\nManual interference is required (lock has to be removed manually)"; COLOUR='danger'; send_to_slack &>/dev/null
+            echo "`date`" > ${mft_dir}/${RELEASE}.lock
+            break
+        fi
+    done
+fi
+
+# version gathered from CRM component should have A.B.C.D format
+release=$(find `readlink -f ${lreadlink}` -name "*CRM*.tar" -type f -exec basename {} \; | sed 's|.*-CRM-||g' | sed 's|-.*||g' | grep -o "[0-9]*.[0-9]*.[0-9]*.[0-9]*" | head -n1)
+[[ -z ${release} ]] && release=${lreadlink##*/} # protection against incomplete release
+
+#--------------------------------------------------------------------#
+#------------------------- RELEASE CHECK ----------------------------#
+#--------------------------------------------------------------------#
+
+echo -e "\nChecking package ${release}. Current timestamp: `date +"%Y-%m-%d %H:%M"`." >> ${log_dir}/${log_file} 2>&1
+
+# check if release directory exists
+[ ! -d ${source_dir} ] && { echo "Release ${release} not sent, because of lacking ${source_dir} directory" >> ${log_dir}/${log_file} 2>&1; exit 1; }
+
+# check if another process is running
+if [[ ! `ps -ef | grep c2m_release | wc -l` -lt 4 ]]; then
+    echo "Another process is already uploading package." >> ${log_dir}/${log_file} 2>&1
+    find `readlink -f ${source_dir}` -type f -print0 | xargs -0 md5sum | awk '{print $1}' > ${log_dir}/`sed 's|.md5sum|_check_new.md5sum|g' <<< ${current_md5sum}`
+    echo "Checking if any changes were introduced to a package." >> ${log_dir}/${log_file} 2>&1
+
+    [ -f ${log_dir}/${current_md5sum} ] && [ -f ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}` ] && \
+    CHECK_FILE=`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}` || \
+    CHECK_FILE=${current_md5sum}
+
+    if [[ $(cmp ${log_dir}/`sed 's|.md5sum|_check_new.md5sum|g' <<< ${current_md5sum}` ${log_dir}/$CHECK_FILE) ]]; then
+        echo "There are updates in package. Killing last uploading process." >> ${log_dir}/${log_file} 2>&1
+        kill $(ps aux | grep "sftp TUS-FIN-CBS-MBL@62.71.178.7" | grep -v grep | awk '{print $2}')
+        rm -r ${log_dir}/$CHECK_FILE
+        mv ${log_dir}/`sed 's|.md5sum|_check_new.md5sum|g' <<< ${current_md5sum}` ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}`
+    else
+        echo "No changes were commited to a package. Exiting." >> ${log_dir}/${log_file} 2>&1
+        rm -r ${log_dir}/`sed 's|.md5sum|_check_new.md5sum|g' <<< ${current_md5sum}`
+        exit 0
+    fi
+fi
+
+# check if new changes have been commited
+if [ ! -f ${log_dir}/${current_md5sum} ]; then
+    find `readlink -f ${source_dir}` -type f -print0 | xargs -0 md5sum | awk '{print $1}' > ${log_dir}/${current_md5sum}
+elif [ -f ${log_dir}/${current_md5sum} ]; then
+    find `readlink -f ${source_dir}` -type f -print0 | xargs -0 md5sum | awk '{print $1}' > ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}`
+    if [[ $(cmp ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}` ${log_dir}/${current_md5sum}) ]]; then
+        rm -r ${log_dir}/${current_md5sum}
+        mv ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}` ${log_dir}/${current_md5sum}
+    else
+        rm -r ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}`
+        echo "Package hasn't got any updates since last upload. Skipping upload process." >> ${log_dir}/${log_file} 2>&1
+        exit 1
+    fi
+fi
+
+#--------------------------------------------------------------------#
+#-------------------------- PROGRAM CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+echo "Starting uploading package to ${REMOTE_ADDRESS}" >> ${log_dir}/${log_file} 2>&1
+echo "Package contains below components:" >> ${log_dir}/${log_file} 2>&1
+
+cd ${source_dir}
+GZIP=-n /usr/local/bin/tar --sort=name -zcvf ${mft_dir}/${release}.tar.gz * >> ${log_dir}/${log_file} 2>&1 # custom path for 'tar' command; generate archive (tar uses gzip, which by default puts a timestamp in the archive)
+md5sum ${mft_dir}/${release}.tar.gz > ${mft_dir}/${release}.tar.gz.md5 # generate md5sum file to compare on remote file with original checksum
+TITLE="Release ${release} was prepared for upload - size: `du -h "${mft_dir}/${release}.tar.gz" | cut -f1`"; COLOUR='#439FE0'; send_to_slack &>/dev/null
+
+TITLE="Components included in package:\n`find ${lreadlink} -maxdepth 1 -mindepth 1 \( -name "*.zip" -or -name "*.tar*" -or -name "*.sh" \) -exec basename {} \; | sort | tr '\n' ' ' | sed 's| |\\n|g'`"; COLOUR='#e04378'; send_to_slack &>/dev/null
+for COMPONENT in `grep ^COMPONENTS_CHECK_${RELEASE%-*} ~/bin/releases.arr | cut -d' ' -f2-`; do
+    if [[ ! `find ${lreadlink} ! -name "*.info" | grep ${COMPONENT}` ]]; then # check if package has all required files
+        echo "Package does not contain ${COMPONENT} component" >> ${log_dir}/${log_file} 2>&1
+        TITLE="Release ${release} does not contain ${COMPONENT} component"; COLOUR='warning'; send_to_slack &>/dev/null
+    fi
+done
+
+TITLE="Starting upload process to remote ${REMOTE_ADDRESS} host"; COLOUR='#d239dd'; send_to_slack &>/dev/null
+if [[ `grep TS <<< ${RELEASE}` ]]; then # external server provided by client
+    COPY_2_MFT >> ${log_dir}/${log_file} 2>&1
+
+    if [[ ${mft_code} != 0 ]]; then        
+        [ ! -f ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}` ] && \
+        rm -f ${log_dir}/${current_md5sum} || \
+        rm -f ${log_dir}/`sed 's|.md5sum|_new.md5sum|g' <<< ${current_md5sum}`
+
+        TITLE="Release ${release} was uploaded to ${REMOTE_ADDRESS} with errors.\nPlease check logfile: ${log_file}"; COLOUR='danger'; send_to_slack &>/dev/null
+        echo "Release ${release} was uploaded to ${REMOTE_ADDRESS} with errors. Please check logfile: ${log_file}" >> ${log_dir}/${log_file} 2>&1
+    else
+        TITLE="Release ${release} was successfully uploaded to remote address: ${REMOTE_ADDRESS}"; COLOUR='good'; send_to_slack &>/dev/null
+        echo "Release ${release} was successfully uploaded to remote address: ${REMOTE_ADDRESS}" >> ${log_dir}/${log_file} 2>&1
+    fi
+else 
+    # implementation server within the Comarch's infrastructure
+    echo ${release} ${log_dir} ${current_md5sum} # providing captured variable to an external script (errors are handled by external functions)
+fi

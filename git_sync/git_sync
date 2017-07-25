@@ -1,0 +1,52 @@
+#!/bin/bash -
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="23.03.2017r."
+SCRIPT_VERSION="0.0.1"
+
+source ~/bin/location_finder
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function upstream_repository_sync() {
+	read -p "Please define origin repository URL (for example: git@servername:username/project-implementation.git): " ORIGIN_URL
+	read -p "Please define head folder name of origin repository: " HEAD_FOLDER
+	read -p "Please define upstream repository URL (for example: ssh://git@localhost:8098/client/custom.git): " UPSTREAM_URL
+
+	mkdir -p ${BIN_REPO}/implementation_repository # create required directories
+	git clone ${ORIGIN_URL} ${BIN_REPO}/implementation_repository # clone the whole repository, including tree (not --bare) to specific folder
+
+	cd ${BIN_REPO}/implementation_repository/${HEAD_FOLDER}
+	git remote add upstream ${UPSTREAM_URL} # to verify configuration - git remote -v
+	git fetch upstream
+	git fetch -p --tags upstream # fetch all tags from the remote (before fetching, remove any remote-tracking references that no longer exist on the remote)
+	git checkout master
+	git merge upstream/master # without losing local changes
+
+	# checkout all branches before push command (https://stackoverflow.com/questions/6865302/push-local-git-repo-to-new-remote-including-all-branches-and-tags)
+	for REMOTE_BRANCH in `git branch -r | grep -v master`; do git checkout --track ${REMOTE_BRANCH}; done
+
+	git push --mirror ${ORIGIN_URL} # mirror push to implementation repository
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+upstream_repository_sync

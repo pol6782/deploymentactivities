@@ -1,0 +1,83 @@
+#!/bin/bash -
+# build_date=27.03.2017
+# automation of SSH agent creation, without password prompt
+# SCRIPT INDUCTION: source /<script directory>/run_ssh_agent <passphrase for private key>
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- PATHS AND VARIABLES -------------------------#
+#--------------------------------------------------------------------#
+
+PASSPHRASE="$1" # passphrase to private key
+EXPECT_SCRIPT="agent_run_$(date +%Y-%m-%d_%H-%M-%S-%N)".sh
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function launch_ssh_agent() {
+	# Output our bash script file - BEGIN
+	cat <<< '
+	#!/bin/bash
+
+	set -u     # Stop if an unbound variable is referenced
+	set -e     # Stop on first error
+	export HISTIGNORE="expect*";
+
+	# Normal CMDs
+	eval "$(ssh-agent -s)"; sleep 0.5;
+
+	# Define VAR passed when this bash-script was launched
+	password="$@"
+
+	# Launch the expect magic
+	expect -c "
+	spawn ssh-add ${HOME}/.ssh/id_rsa
+	expect "?assword:"
+	send \"$password\r\"
+	expect "?password:"
+	send \"$password\r\"
+	expect eof"
+
+	export HISTIGNORE="";
+	export password="";
+	' > /tmp/${EXPECT_SCRIPT}
+	# Output our bash script file - END
+
+	chmod +x /tmp/${EXPECT_SCRIPT}; /tmp/${EXPECT_SCRIPT} "$PASSPHRASE" # add executable privileges to script and run SSH agent
+	unset password # unset unused variables
+
+	AGENT_PID=$(ps -fu ${USER} | grep ssh-agent | grep -v grep | awk '{print $2}') # obtaining ssh agent pid
+	AGENT_LINK_PID=$((AGENT_PID-1)) # working ssh agent pid (decreased by one)
+	AGENT_WORKING_DIRECTORY=`find /tmp/ -name "agent.${AGENT_LINK_PID}" 2>&-` # ssh agent working directory
+
+	if [[ -z ${AGENT_WORKING_DIRECTORY} ]]; then
+		echo "[ CRITICAL ERROR ] Agent working directory was not found in /tmp location"
+		echo "[ CRITICAL ERROR ] Please contact with ITOPS department"
+	else
+		echo "[ INFO ] Exporting SSH_AUTH_SOCK=${AGENT_WORKING_DIRECTORY} to system variables"
+		ln -sfn ${AGENT_WORKING_DIRECTORY} ~/.ssh/ssh_auth_sock # create softlink to current SSH agent
+		export SSH_AUTH_SOCK="${AGENT_WORKING_DIRECTORY}"
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+if [[ $(ps -fu ${USER} | grep 'ssh-agent' | grep -v grep | awk '{print $2}' | wc -l) -ne 1 ]]; then
+	echo "[ INFO ] Restarting SSH agent on `hostname` host (`date`)"
+	ps -fu ${USER} | grep ssh-agent | grep -v grep | awk '{print $2}' | xargs kill -9 2>&- # killing all remainings SSH agents
+	find /tmp -user ${USER} \( -name "agent_run*" -o -name "ssh-*" \) 2>&- -exec rm -rf {} + # remove deprecated files
+	launch_ssh_agent
+fi

@@ -1,0 +1,88 @@
+#!/bin/bash -
+# build_date=20.04.2017
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function send_to_slack() {
+	AUTH_TOKEN=`grep ^SLACK_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $2}'` # Slack webhook (AUTH_TOKEN)
+	ROOM_ID=`grep ^SLACK_CREDENTIALS ${SERVERS_ARR_FILE} | awk '{print $3}'` # room name for Slack application
+    POSIX_TIME=`date +%s` # timestamp
+
+    curl -X POST --data '{
+    	"channel":"'"#${ROOM_ID}"'", "username":"Bamboo Supervisor",
+    	"attachments": [{"fallback":"Upload release to repository", "pretext":"'"Deployment automation - upload process for ${RELEASE} release"'",
+    	"mrkdwn":"true", "color":"'"${COLOUR}"'", "title":"'"${TITLE}"'",
+    	"footer":"Administrator contact: adam.chalat@comarch.com", "footer_icon":"https://platform.slack-edge.com/img/default_application_icon.png", "ts":"'"${POSIX_TIME}"'"}]
+    }' -i ${AUTH_TOKEN}
+}
+
+function artifactory_refresh() {
+	(
+		# wait for lock on /data/bamboo/projects/NGENA/logs/semaphore/artifactory_refresh.pid (fd 200) for 10 seconds
+		# the 200>/artifactory_refresh.pid causes that process to open up /artifactory_refresh.pid for writing, on file descriptor 200
+		# the parentheses create a subshell, a new process, separate from the parent process
+		flock -x -w 10 200 || exit 1
+
+		# function induction in cron: */15 7-18 * * 1-5 flock -n /data/bamboo/NGENA/logs/semaphore/artifactory_refresh.pid -c "/data/bamboo/NGENA/bin/cron_inductions artifactory_refresh"
+		load_keys_and_variables
+
+		PROJECT=$1; shift # grab first parameter and shift
+		DATE=`date +"%m-%d-%Y"`
+		UPLOAD_TRIGGER=`grep ^UPLOAD_TRIGGER ${SERVERS_ARR_FILE} | awk '{print $2}'`
+		LOCA_USER='crm'; LOCAL_ADDRESS='10.133.105.124'; REMOTE_ADDRESS='10.132.4.72' # default variables
+		mkdir -p ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE} ${BIN_REPO}/uploaded_packages/${PROJECT} # create required directories
+
+		echo "[ `date +"%H:%M:%S"` ] Checking if new build was delivered on ${LOCAL_ADDRESS} host" >> ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE}/${UPLOAD_TRIGGER}_extract_logs
+		RESULT=$(ssh -qo BatchMode=yes ${LOCA_USER}@${LOCAL_ADDRESS} "bash -l -c '~/bin/upload_packages ${PROJECT}'" 2>&1); SSH_CODE=$?
+		if [[ ${SSH_CODE} -eq 0 ]]; then
+			RELEASE=`echo ${RESULT} | awk '{print $1}'`; LOG_DIR=`echo ${RESULT} | awk '{print $2}'`; MD5_SUM=`echo ${RESULT} | awk '{print $3}'`
+			echo "[ `date +"%H:%M:%S"` ] New release ${RELEASE} was delivered. Starting upload process to ${BIN_REPO}/uploaded_packages/${PROJECT} location" >> ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE}/${UPLOAD_TRIGGER}_extract_logs
+			scp ${LOCA_USER}@${LOCAL_ADDRESS}:/home/luntbuild/crm_releases/mft/${RELEASE}.tar.gz{,.md5} ${BIN_REPO}/uploaded_packages/${PROJECT} &>/dev/null; mft_code=$?
+
+			if [[ ${mft_code} != 0 ]]; then
+				TITLE="Release ${RELEASE} was uploaded to ${REMOTE_ADDRESS} with errors.\nPlease check logfile: ${log_file}"; COLOUR='danger'; send_to_slack &>/dev/null
+				echo "[ `date +"%H:%M:%S"` ] Release ${RELEASE} was uploaded to ${REMOTE_ADDRESS} with errors. Please check logfile: ${log_file}"  >> ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE}/${UPLOAD_TRIGGER}_extract_logs 2>&1
+
+				REMOTE_CHECK=$(ssh -qo BatchMode=yes ${LOCA_USER}@${LOCAL_ADDRESS} "bash -l -c '[ ! -f ${LOG_DIR}/`sed 's|.md5sum|_new.md5sum|g' <<< ${MD5_SUM}` ]'" 2>&1); CHECK_CODE=$?
+				[ ${CHECK_CODE} -eq 0 ] && \
+				ssh -qo BatchMode=yes ${LOCA_USER}@${LOCAL_ADDRESS} "bash -l -c 'rm -f ${LOG_DIR}/${MD5_SUM}'" 2>&1 || \
+				ssh -qo BatchMode=yes ${LOCA_USER}@${LOCAL_ADDRESS} "bash -l -c 'rm -f ${LOG_DIR}/`sed 's|.md5sum|_new.md5sum|g' <<< ${MD5_SUM}`'" 2>&1
+			else
+				TITLE="Release ${RELEASE} was successfully uploaded to remote address: ${REMOTE_ADDRESS}"; COLOUR='good'; send_to_slack &>/dev/null
+				echo "[ `date +"%H:%M:%S"` ] Release ${RELEASE} was successfully uploaded to remote address: ${REMOTE_ADDRESS}"  >> ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE}/${UPLOAD_TRIGGER}_extract_logs 2>&1
+
+				# management script dedicated to handle deployment automation (upload packages to artifactory repository)
+				# each process should be run in background to avoid holding another processes
+				${BIN_PATH}/extractpackage $@ >> ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE}/${UPLOAD_TRIGGER}_extract_logs &
+			fi
+		else
+			echo "[ `date +"%H:%M:%S"` ] No new changes have been made on ${LOCAL_ADDRESS} host. Skipping upload process." >> ${LOGS_DIR}/Extract_package/${UPLOAD_TRIGGER}/${DATE}/${UPLOAD_TRIGGER}_extract_logs
+		fi
+		) 200>/data/bamboo/projects/NGENA/logs/semaphore/artifactory_refresh.pid
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+# name of environment corresponds with ARTIFACTORY_SUFFIX in servers.arr
+# first loop parameter: project name, second: repository name, third: environment name
+for PROJECT in NGENA:NGENA_Release:NGN_P4 DTAG:DTAG_Release:DTAG_53; do
+	PROJECT_NAME=${PROJECT%%:*}; TEMP_REPOSITORY=${PROJECT%:*}; REPOSITORY=${TEMP_REPOSITORY#*:}; ENVIRONMENT_NAME=${PROJECT##*:}
+
+	source /data/bamboo/projects/deployment-scripts/common artifactory_refresh ${PROJECT_NAME}
+	artifactory_refresh ${PROJECT_NAME} FAKE_VERSION upload ${REPOSITORY} ${ENVIRONMENT_NAME}
+done

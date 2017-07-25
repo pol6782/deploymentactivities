@@ -1,0 +1,276 @@
+#!/bin/bash -
+# SA upgrade tool by arkadiusz.bronka@comarch.com and adam.chalat@comarch.com
+# build_date=14.10.2016
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+STEP_NAME="SA_Upgrade_Binaries"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+script_help $@ # induction to external script's manual if number of arguments is lower then required
+check_source # check presence of repository source in repo-bin directory
+
+RHOME=`grep ^"${ENV}" ${BIN_PATH}/servers.arr | grep SA | head -n1 | awk '{ print $6 }'`
+
+#--------------------------------------------------------------------#
+#----------------------------- PATHS --------------------------------#
+#--------------------------------------------------------------------#
+
+REMOTE_ZIP_DIR=${RHOME}/bamboo
+DATA_ADAPTER="${RHOME}/config/dataAdapters"
+DATA_PROCESSORS="${RHOME}/config/dataProcessors"
+DATA_REPOSITORIES="${RHOME}/config/dataRepositories"
+DATA_INSIGHT="${RHOME}/config/insight"
+DATA_INSTALLER="${RHOME}/release-package/install/installer"
+
+#--------------------------------------------------------------------#
+#--------------------------- FUNCTIONS ------------------------------#
+#--------------------------------------------------------------------#
+
+function copy_to_server() {
+    mkdir -p ${VERSION_DIR}/SA
+    tar -xf ${VERSION_DIR}/${VERSION}-SA.tar -C ${VERSION_DIR}/SA
+    run_remote_command ${SERV[2]} "mkdir -p ${REMOTE_ZIP_DIR}"
+
+    fLog "SA binaries - release package, configuration package and ZooKeeper package"
+    fLog "Files: release-package.tgz, TeliaSonera_configuration.tgz, ZooKeeper.tgz"
+    fLog "Destination directory: ${REMOTE_ZIP_DIR}"
+    RESULT=$(scp -rpq ${VERSION_DIR}/SA/{release-package,TeliaSonera_configuration,ZooKeeper}.tgz ${USER}@${HOST}:${REMOTE_ZIP_DIR} 2>&1)
+    CODE=$?; check_errors
+    fLog "SA binaries - release package, configuration package and ZooKeeper package - copied successfully"
+
+    fLog "Copying ZooKeeper manage script"
+    fLog "File: `basename ${TOSERVERS_PATH}/zk_manage`"
+    fLog "Destination directory: ${BIN_DIR}"
+    RESULT=$(scp -pq ${TOSERVERS_PATH}/zk_manage ${USER}@${HOST}:${BIN_DIR} 2>&1)
+    CODE=$?; check_errors
+    run_remote_command ${SERV[2]} "chmod 764 ${BIN_DIR}/zk_manage"
+    fLog "ZooKeeper manage script was copied successfully"
+}
+
+function sa_stop() {
+    fLog "Stopping SA components"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/config; ./run_insight.sh stop"
+    fLog "SA components stopped successfully"
+}
+
+function sa_backup_configuration() {
+    fLog "SA backup actually used configuration"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/tools; ./backup.sh ${RHOME}/backup"
+    fLog "SA backup actually used release-package"
+    run_remote_command ${SERV[2]} "cd ${RHOME}; tar -czf ./backup/release-package_`date +%y%m%d_%H%M`.tgz release-package"
+    fLog "SA backup actually used configuration - finished"
+}
+
+function sa_create_logs_dirs_and_copy_files() {
+    fLog "SA create logs directories and copy files"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/dataAdapters/{AdapterAsciiEmail,AdapterMsgBP,AdapterMsgBPE,AdapterMsgCAC,AdapterMsgCRM,AdapterMsgCTSP,AdapterMsgDHCP,AdapterMsgLT,AdapterMsgMAC,AdapterMsgNGSFResponse,AdapterSFTP_BSUpload}/logs"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/dataAdapters/{AdapterMsgBSS,AdapterMsgCGW,AdapterMsgCOLT,AdapterMsgColtSapAsync,AdapterMsgMobileCPL,AdapterMsgMobilePCRF,AdapterMsgNGSFRequest,AdapterMsgSAP,AdapterMsgSDE,AdapterMsgSSO,AdapterSQLRM}/logs/daily"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/dataProcessors/{CRMEventsQueue,EmailsProcessor,GBI_DataProcessor,NGSFEventsQueue,AlarmRepository,LogRepository,StatsRepository}/logs"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/dataRepositories/{AlarmRepository,LogRepository,StatsRepository}/logs"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/insight/{AuthSystem,Configurator,EscalationSystem,NotifyingSystem}/logs"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/{config,config_persistency}/dataProcessors/{CRMEventsQueue,EmailsProcessor,ProcessorSPMM,NGSFEventsQueue}/persistency"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/management/Manager/logs" 
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_logs/dataProcessors/ProcessorSPMM/logs/daily"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config_persistency/dataProcessors/ProcessorSPMM/infinispan"
+    run_remote_command ${SERV[2]} "mkdir -p ${RHOME}/config/dataProcessors/ProcessorSPMM/runContainer/infinispan"
+    fLog "SA create logs directories and copy files - finished"
+}
+
+function sa_persistency_copy() {
+    fLog "SA create persistency directories and copy files"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterAsciiEmail/logs ${RHOME}/config_logs/dataAdapters/AdapterAsciiEmail/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgBP/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgBP/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgBPE/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgBPE/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgBSS/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgBSS/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgCAC/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgCAC/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgCGW/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgCGW/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgCOLT/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgCOLT/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgColtSapAsync/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgColtSapAsync/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgCRM/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgCRM/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgCTSP/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgCTSP/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgDHCP/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgDHCP/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgLT/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgLT/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgMAC/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgMAC/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgMobileCPL/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgMobileCPL/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgMobilePCRF/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgMobilePCRF/logs/daily"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgNGSFRequest/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgNGSFRequest/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgNGSFResponse/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgNGSFResponse/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgSAP/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgSAP/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgSDE/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgSDE/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterMsgSSO/logs ${RHOME}/config_logs/dataAdapters/AdapterMsgSSO/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterSFTP_BSUpload/logs ${RHOME}/config_logs/dataAdapters/AdapterSFTP_BSUpload/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_ADAPTER}/AdapterSQLRM/logs ${RHOME}/config_logs/dataAdapters/AdapterSQLRM/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/CRMEventsQueue/logs ${RHOME}/config_logs/dataProcessors/CRMEventsQueue/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/EmailsProcessor/logs ${RHOME}/config_logs/dataProcessors/EmailsProcessor/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/GBI_DataProcessor/logs ${RHOME}/config_logs/dataProcessors/GBI_DataProcessor/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/NGSFEventsQueue/logs ${RHOME}/config_logs/dataProcessors/NGSFEventsQueue/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/ProcessorSPMM/logs ${RHOME}/config_logs/dataProcessors/ProcessorSPMM/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_REPOSITORIES}/AlarmRepository/logs ${RHOME}/config_logs/dataRepositories/AlarmRepository/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_REPOSITORIES}/LogRepository/logs ${RHOME}/config_logs/dataRepositories/LogRepository/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_REPOSITORIES}/StatsRepository/logs ${RHOME}/config_logs/dataRepositories/StatsRepository/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_INSIGHT}/AuthSystem/logs ${RHOME}/config_logs/insight/AuthSystem/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_INSIGHT}/Configurator/logs ${RHOME}/config_logs/insight/Configurator/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_INSIGHT}/EscalationSystem/logs ${RHOME}/config_logs/insight/EscalationSystem/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_INSIGHT}/NotifyingSystem/logs ${RHOME}/config_logs/insight/NotifyingSystem/logs"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/CRMEventsQueue/persistency ${RHOME}/config_persistency/dataProcessors/CRMEventsQueue/persistency"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/EmailsProcessor/persistency ${RHOME}/config_persistency/dataProcessors/EmailsProcessor/persistency"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/NGSFEventsQueue/persistency ${RHOME}/config_persistency/dataProcessors/NGSFEventsQueue/persistency"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/ProcessorSPMM/persistency ${RHOME}/config_persistency/dataProcessors/ProcessorSPMM/persistency"
+    run_remote_command ${SERV[2]} "cp -rp ${DATA_PROCESSORS}/ProcessorSPMM/runContainer/infinispan ${RHOME}/config_persistency/dataProcessors/ProcessorSPMM/infinispan"
+    run_remote_command ${SERV[2]} "cp -rp ${RHOME}/config/management/Manager/logs ${RHOME}/config_logs/management/Manager/logs"
+    fLog "SA create persistency directories and copy files - finished"
+}
+
+function sa_unpack() {
+    fLog "SA unpack release-package and configuration"
+    run_remote_command ${SERV[2]} "cd ${REMOTE_ZIP_DIR}; rm -rf release-package; tar -xf release-package.tgz -C ${REMOTE_ZIP_DIR}"
+    run_remote_command ${SERV[2]} "cd ${REMOTE_ZIP_DIR}; rm -rf config; tar -xf TeliaSonera_configuration.tgz -C ${REMOTE_ZIP_DIR}"
+    fLog "SA unpack configuration - finished"
+}
+
+function sa_move_unpacked_configuration() {
+    fLog "SA move unpacked release-package and configuration"
+    run_remote_command ${SERV[2]} "rm -rf ${RHOME}/config ${RHOME}/release-package"
+    run_remote_command ${SERV[2]} "mv -t ${RHOME} ${REMOTE_ZIP_DIR}/release-package ${REMOTE_ZIP_DIR}/config"
+    run_remote_command ${SERV[2]} "find ${RHOME}/release-package ${RHOME}/config \( -name \"*.sh\" -o -name \"*.so\" \) | xargs chmod u+x"
+    fLog "SA move unpacked configuration - finished"
+}
+
+function zookeeper_configuration() {
+    ZIP_FILE=`find ${VERSION_DIR}/SA -name ZooKeeper.tgz` # package containing configuration files
+    CRM_SERVER=(`grep CRM ${BIN_PATH}/servers.arr | grep ${ENV} | grep 1`) # jumping to CRM user, $USER and $RHOME and $HOST are dynamic variables and their name must be static
+    local HOST=${CRM_SERVER[2]}; local USER="${CRM_SERVER[4]}"; local RHOME="${CRM_SERVER[5]}"
+    TEMP_DIR=${RHOME}/Temp_Install
+
+    fLog "Copying SA configuration files"
+    fLog "File: `basename ${ZIP_FILE}`"
+    fLog "Destination directory: ${TEMP_DIR}"
+    RESULT=$(scp -pq ${ZIP_FILE} ${USER}@${HOST}:${TEMP_DIR} 2>&1)
+    CODE=$?; check_errors
+    fLog "SA configuration files were copied successfully"
+
+    fLog "Extracting SA configuration files"
+    run_remote_command ${HOST} "mkdir -p ${TEMP_DIR}/${VERSION}"
+    run_remote_command ${HOST} "tar -zxf ${TEMP_DIR}/`basename ${ZIP_FILE}` -C ${TEMP_DIR}/${VERSION}"
+    fLog "SA configuration files were extracted successfully"
+
+    function install_configuration_changes() {
+        FILES="${TEMP_DIR}/${VERSION}/ZooKeeper/${ENV}/properties_config.xml ${TEMP_DIR}/${VERSION}/ZooKeeper/${ENV}/values.properties ${TEMP_DIR}/${VERSION}/ZooKeeper/${ENV}/clients_config.xml"
+        INITIAL_DATE=$(run_remote_command ${HOST} "date -d\"`date +"%F %H:%M:%S"`\" +%s" | tail -n1) # get time before shuttling file
+
+        DEST_DIR=${RHOME}/config_management/data/files
+        fLog "Shuttling files for ZooKeeper"
+        run_remote_command ${HOST} "mv ${FILES} ${DEST_DIR}"
+        run_remote_command ${HOST} "touch ${DEST_DIR}/values.properties"
+        sleep 120 # wait for changes propagation
+        fLog "Files for ZooKeeper were shuttled successfully"
+    }
+
+    function check_configuration() {
+        fLog "Checking if configuration updates have been applied properly"
+
+        # convert time to seconds
+        function CLIENT_DATE() { run_remote_command ${HOST} "grep Processing ${RHOME}/config_management/logs/client.log | tail -n1 | sed \"s|,.*||g\"" | date -d"`tail -n1`" +%s | tail -n1; }
+        function LAST_COMMIT() { run_remote_command ${HOST} "grep Processing ${RHOME}/config_management/logs/client.log | tail -n1 | sed \"s|,.*||g\"" | tail -n1; }
+        # check the status of ZK components
+        function ZK_WORKING_TEST() { run_remote_command ${HOST} "zk_manage all status ${ENV} | grep is\ running | wc -l" | tail -n1; }
+        # update configuration file when clinet has to be restarted
+        function TOUCH_VALUES() { CRM_SERVER=(`grep CRM ${BIN_PATH}/servers.arr | grep ${ENV} | grep -w '1'`); local USER="${CRM_SERVER[4]}"; run_remote_command ${CRM_SERVER[2]} "touch ${DEST_DIR}/values.properties"; }
+
+        fLog "Checking if ZooKeeper server is currently running"
+        CHECK_ZK_SERVER=$(run_remote_command ${HOST} -n "[[ \`zk_manage server status ${ENV} | grep is\ running | wc -l\` -eq 1 ]]") # check if ZK server is working
+        if [ "$?" != "0" ] || [ ${INITIAL_DATE} -gt `CLIENT_DATE` ]; then
+            fLog "ZooKeeper server is not running or configuration updates were not shuttled successfully. Restarting."
+            run_remote_command ${HOST} "zk_manage server restart ${ENV}"
+        else
+            fLog -n "$(colored "32" "[ INFO ]") ZooKeeper server is running. Processing."
+        fi
+
+        fLog "Checking if ZooKeeper: client, supervisor and watcher are currently running"
+        if [[ `ZK_WORKING_TEST` -ne 4 ]]; then
+            fLog "$(colored "31" "[ WARNING ]") ZooKeeper didn't start properly (client, file-watcher or supervisor). Restarting."
+            run_remote_command ${HOST} "zk_manage all restart ${ENV}" # built-in error validation
+        else
+            fLog -n "$(colored "32" "[ INFO ]") ZooKeeper: client, file-watcher and supervisor are running. Processing."
+        fi
+
+        for SERVER in "${SERVERS_ARRAY[@]}"; do
+            SERV_ITER=($SERVER)
+            if [[ "${SERV_ITER[0]}" = "${ENV}" && "${SERV_ITER[1]}" == 'SA' ]]; then
+                local HOST="${SERV_ITER[2]}"; local USER="${SERV_ITER[4]}"; local RHOME="${SERV_ITER[5]}"
+
+                CHECK_CLIENT=$(run_remote_command ${HOST} -n "[[ \`zk_manage client status ${ENV} | grep not\ working | wc -l\` -eq 0 ]]") # check if ZK client is working
+                if [ "$?" != "0" ] || [ ${INITIAL_DATE} -gt `CLIENT_DATE` ]; then
+                    fLog "Restarting ZooKeeper component to bring the correct changes propagation"
+                    run_remote_command ${HOST} "zk_manage client restart ${ENV}"
+                    TOUCH_VALUES
+                    sleep 60 # wait for changes propagation
+                    if [ ${INITIAL_DATE} -gt `CLIENT_DATE` ]; then
+                        fLog "$(colored "31" "[ WARNING ]") Configuration updates were not applied successfully on ${SERV_ITER[2]}. Aborting deployment."
+                        fLog "$(colored "31" "[ WARNING ]") Last configuration change: `LAST_COMMIT`"
+                        stop_deployment "Configuration updates were not applied successfully on ${SERV_ITER[2]}"
+                    fi
+                fi
+            fi
+        done
+
+        fLog "$(colored "32" "[ INFO ]") Configuration updates were applied successfully. Processing deployment."
+    }
+
+    install_configuration_changes
+    check_configuration
+}
+
+function sa_autoconfigure() {
+    fLog "SA try to autoconfigure components"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/config; ${DATA_INSTALLER}/recreate.sh"
+    ARGUMENT_LIST=( "${DATA_ADAPTER}/AdapterAsciiEmail/runContainer" "${DATA_ADAPTER}/AdapterMsgBP/runContainer" "${DATA_ADAPTER}/AdapterMsgBPE/runContainer" "${DATA_ADAPTER}/AdapterMsgBSS/runContainer" "${DATA_ADAPTER}/AdapterMsgCAC/runContainer" "${DATA_ADAPTER}/AdapterMsgCGW/runContainer" "${DATA_ADAPTER}/AdapterMsgCOLT/runContainer" "${DATA_ADAPTER}/AdapterMsgColtSapAsync/runContainer" "${DATA_ADAPTER}/AdapterMsgCRM/runContainer" "${DATA_ADAPTER}/AdapterMsgCTSP/runContainer" "${DATA_ADAPTER}/AdapterMsgDHCP/runContainer" "${DATA_ADAPTER}/AdapterMsgLT/runContainer" "${DATA_ADAPTER}/AdapterMsgMAC/runContainer" "${DATA_ADAPTER}/AdapterMsgMobileCPL/runContainer" "${DATA_ADAPTER}/AdapterMsgMobilePCRF/runContainer" "${DATA_ADAPTER}/AdapterMsgNGSFRequest/runContainer" "${DATA_ADAPTER}/AdapterMsgNGSFResponse/runContainer" "${DATA_ADAPTER}/AdapterMsgSAP/runContainer" "${DATA_ADAPTER}/AdapterMsgSDE/runContainer" "${DATA_ADAPTER}/AdapterMsgSSO/runContainer" "${DATA_ADAPTER}/AdapterSFTP_BSUpload/runContainer" "${DATA_ADAPTER}/AdapterSQLRM/runContainer" "${DATA_PROCESSORS}/CRMEventsQueue/runContainer" "${DATA_PROCESSORS}/EmailsProcessor/runContainer" "${DATA_PROCESSORS}/GBI_DataProcessor/runContainer" "${DATA_PROCESSORS}/NGSFEventsQueue/runContainer" "${DATA_PROCESSORS}/ProcessorSPMM/runContainer" "${DATA_REPOSITORIES}/AlarmRepository/runContainer" "${DATA_REPOSITORIES}/LogRepository/runContainer" "${DATA_REPOSITORIES}/StatsRepository/runContainer" "${DATA_INSIGHT}/AuthSystem/runContainer" "${DATA_INSIGHT}/Configurator/runContainer" "${DATA_INSIGHT}/EscalationSystem/runContainer" "${DATA_INSIGHT}/NotifyingSystem/runContainer" "${RHOME}/config/management/Manager/runContainer" )
+    for SCRIPT_ARGUMENT in "${ARGUMENT_LIST[@]}"; do
+        run_remote_command ${SERV[2]} "${DATA_INSTALLER}/autoconfigure.sh ${SCRIPT_ARGUMENT}"
+    done
+    fLog "SA components autoconfigured"
+}
+
+function sa_start() {
+    fLog "SA try to start components"
+    run_remote_command ${SERV[2]} "cd ${RHOME}/config; ./run_insight.sh start ${ENV}_conf.subsystems"
+    fLog "SA components started"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+    SERV=($SERVER)
+    if [[ "${SERV[0]}" = "${ENV}" && "${SERV[1]}" = "SA" ]]; then
+        USER="${SERV[4]}"; HOST="${SERV[2]}"
+
+        copy_to_server
+        sa_stop
+        sa_backup_configuration
+        sa_create_logs_dirs_and_copy_files
+        sa_persistency_copy
+        sa_unpack            
+        sa_move_unpacked_configuration    
+        zookeeper_configuration        
+        sa_autoconfigure             
+        sa_start  
+    fi
+done
+
+source ${BIN_PATH}/common_after

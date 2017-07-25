@@ -1,0 +1,177 @@
+#!/bin/bash -
+# script dedicated for actions related to data archiving and deleting obsolete files
+# IMPORTANT: executing implementation of the mechanism requires user authentication
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="31.05.2017r."
+SCRIPT_VERSION="0.0.3"
+
+CONTACT_LIST='adam.chalat@comarch.com' # list of direct contact persons 
+
+source ~/bin/location_finder
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ $# -lt 3 ]; then
+	echo -e "\nData retention tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Version: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [task]: archive_logs, remove_obsolete_files"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`\n"
+	echo -e "Usage: $(colored "34" "$(basename $0) [task] [environment] [passphrase]")\n"
+	echo -e "$(colored "32" "INFORMATION") In urgent cases please contact Comarch ITOPS department: ${CONTACT_LIST}\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#--------------------- PARAMETERS AND VARIABLES ---------------------#
+#--------------------------------------------------------------------#
+
+TASK=${1,,}
+ENV_NAME=${2^^}
+PASSPHRASE=$3
+PARENT_PID=$$
+
+EXPIRE=$(grep ^EXPIRE_TIME ~/bin/servers.arr | awk '{print $2}') # determine after which time, in days, remove files from servers (key: EXPIRE_TIME - second column)
+VERSIONS_LEFT=$(grep ^EXPIRE_TIME ~/bin/servers.arr | awk '{print $3}') # determine how many versions, integer value, should be left on server (key: EXPIRE_TIME - third column)
+ARCHIVE=$(grep ^EXPIRE_TIME ~/bin/servers.arr | awk '{print $4}') # determine how old logfiles should be archived
+
+POSIX_TIME=$(date +%s)
+
+#--------------------------------------------------------------------#
+#------------------------- PRECONDITIONS ----------------------------#
+#--------------------------------------------------------------------#
+
+# checking the definition correctness for environment
+if [ ${SHOW_ENV_NAME,,} != ${ENV_NAME,,} ]; then
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Wrong environment was definied during script induction."
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Current environment: ${SHOW_ENV_NAME^^}. Definied environment: ${ENV_NAME^^}.\n"
+	exit 1
+fi
+
+# checking the definition correctness of variables and default path
+if ([[ -z ${EXPIRE} ]] || [[ -z ${VERSIONS_LEFT} ]] || [[ -z ${ARCHIVE} ]]) || [[ -z ${SHOW_DEFAULT_PATH} ]]; then
+	([[ -z ${EXPIRE} ]] || [[ -z ${VERSIONS_LEFT} ]] || [[ -z ${ARCHIVE} ]]) && \
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Missing configuration in servers.arr file (key EXPIRE_TIME needs to be veryfied)" || \
+	echo -e "\n$(colored "31" "[ CRITICAL ERROR ]") Lacking home directory variable - servers.arr configuration file has to be checked"
+
+	echo -e "$(colored "31" "[ CRITICAL ERROR ]") Please contact Comarch ITOPS department: ${CONTACT_LIST}\n"
+	exit 1
+fi
+
+# try entered passphrase to decode password for encrypted management scripts
+# cat <filename> | openssl aes-128-cbc -a -salt -k <passphrase> > <filename>.enc
+cat ${HOME}/bin/.decode.enc | openssl aes-128-cbc -a -d -salt -k ${PASSPHRASE} > /tmp/.decode 2>/dev/null
+[[ $? -ne 0 ]] && { echo -e "\n$(colored "31" "[ WARNING ]") Entered passphrase is incorrect. Please contact Comarch ITOPS department: ${CONTACT_LIST}"; exit 1; }
+
+# checking inclusion of proper task for current environment
+if ! grep ^DATA_RETENTION ~/bin/servers.arr | grep -Po "${SHOW_ENV_NAME}[^ ]+" | grep -q "${TASK}"; then
+	echo -e "\n$(colored "31" "[ WARNING ]") Task ${TASK} is currently disabled for ${SHOW_ENV_NAME^^} environment"
+	echo -e "$(colored "31" "[ WARNING ]") Please contact Comarch ITOPS department: ${CONTACT_LIST}\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTION CALL ----------------------------#
+#--------------------------------------------------------------------#
+
+if [[ ${TASK} == 'remove_obsolete_files' ]]; then
+	echo "Invoking the obsolete files removal process at `date +'%Y.%m.%d (time %H:%M:%S)'`"
+	echo "Process information: ${PARENT_PID} PID launched from `whoami`@${IP_ADDRESS}"
+
+	echo -e "\n$(colored "32" "INFORMATION") Definied expire time after which logs should be removed from servers: ${EXPIRE} days"
+	echo -e "$(colored "32" "INFORMATION") Definied protection for recently deployed versions: ${VERSIONS_LEFT} binaries backward"
+
+	if [[ "${SHOW_ENV_TYPE}" =~ ^(CPM|CRM|TUM|BPC|AIF)$ ]]; then
+		# declaration: destination folder and type of searched files/folders
+		[[ "${SHOW_ENV_TYPE}" == 'CRM' ]] && declare -a CLEAN_ARRAY=("Temp_Install" "backups_servers:f" "Temp_Install:d")
+		[[ "${SHOW_ENV_TYPE}" == 'CPM' ]] && declare -a CLEAN_ARRAY=("servers/zip_files" "servers/launcher/current:d")
+		[[ "${SHOW_ENV_TYPE}" == 'TUM' ]] && declare -a CLEAN_ARRAY=("zip_files" "tum_restapi:d")
+		[[ "${SHOW_ENV_TYPE}" == 'BPC' ]] && declare -a CLEAN_ARRAY=("bpc_binaries" "bpc-loader/builds:d" "bpc-rest-api/builds:d")
+		[[ "${SHOW_ENV_TYPE}" == 'AIF' ]] && declare -a CLEAN_ARRAY=("zip_files" "versions:d")
+
+		# start iterating from second element of array (first item: elements for permanent removal)
+		for CLEAN_PATH in ${CLEAN_ARRAY[@]:1:${#CLEAN_ARRAY[@]}}; do
+			DIRECTORY_PATH=${CLEAN_PATH%:*}; SEARCH_TYPE=${CLEAN_PATH#*:}
+
+			echo -e "\n$(colored "34" "INFORMATION") Current destination: ${SHOW_DEFAULT_PATH}/${DIRECTORY_PATH}"
+			# find files older than indicated modification time and remove, expect appointed first selected versions
+			find ${SHOW_DEFAULT_PATH}/${DIRECTORY_PATH} -maxdepth 1 -mindepth 1 -type ${SEARCH_TYPE} -mtime +${EXPIRE} | while read remove_file; do
+				if grep -q `basename ${remove_file}` <<< "$(ls -t ${SHOW_DEFAULT_PATH}/${DIRECTORY_PATH} | sed 1,${VERSIONS_LEFT}d)"; then
+					echo "Removing `[[ ${SEARCH_TYPE} == 'd' ]] && echo directory || echo file`: `basename ${remove_file}`"
+					rm -rf ${remove_file}
+				fi
+			done
+		done
+
+		rm -rf ${SHOW_DEFAULT_PATH}/${CLEAN_ARRAY[0]} # remove permanently from server (deployment binaries)
+	fi
+
+	if [[ "${SHOW_ENV_TYPE}" =~ ^(CRM|DPS)$ ]]; then
+		echo -e "\n$(colored "34" "INFORMATION") Performing additional cleaning actions"
+		if [[ "${SHOW_ENV_TYPE}" == 'CRM' ]]; then
+			find ${SHOW_DEFAULT_PATH}/logs -mindepth 1 -not -path "${SHOW_DEFAULT_PATH}/logs/`date +%Y`/`date +%m`/*" -type d -mtime +${EXPIRE} -exec rm -rf {} + # remove CRM logs (files) from /logs (exclude current month)
+		elif [[ "${SHOW_ENV_TYPE}" == 'DPS' ]]; then
+			find ${SHOW_DEFAULT_PATH}/admin/*/log -maxdepth 1 -mindepth 1 -type d -mtime +${EXPIRE} -exec rm -r {} \; # remove DPS's sids logs from /admin/sid_name/log
+			rm -f /opt/dps/DPS-*.sh # remove temporary DPS binaries
+		fi
+	fi
+elif [[ ${TASK} == 'archive_logs' ]]; then
+	echo "Invoking logfiles archiving process at `date +'%Y.%m.%d (time %H:%M:%S)'`"
+	echo "Process information: ${PARENT_PID} PID launched from `whoami`@${IP_ADDRESS}"
+
+	echo -e "\n$(colored "32" "INFORMATION") Definied border date for archiving logfiles: ${ARCHIVE} days"
+	echo -e "$(colored "32" "INFORMATION") Central destination for archived logfiles: ${SHOW_DEFAULT_PATH}/archived_logfile\n"
+
+	mkdir -p ${SHOW_DEFAULT_PATH}/archived_logfile # create required directories
+
+	if [[ "${SHOW_ENV_TYPE}" =~ ^(CPM|CRM|TUM|BPC|AIF|DPS|QUORUM)$ ]]; then
+		# declaration: list of directories, which should be archived
+		[[ "${SHOW_ENV_TYPE}" == 'CRM' ]] && declare -a ARCHIVE_ARRAY=("logs" "rabbitmq/log")
+		[[ "${SHOW_ENV_TYPE}" == 'CPM' ]] && declare -a ARCHIVE_ARRAY=("servers/launcher/builds" "rabbitmq/log" "servers/ES/*/logs")
+		[[ "${SHOW_ENV_TYPE}" == 'BPC' ]] && declare -a ARCHIVE_ARRAY=("bpc-loader/builds" "bpc-rest-api/builds")
+		[[ "${SHOW_ENV_TYPE}" == 'DPS' ]] && declare -a ARCHIVE_ARRAY=("`grep ^DPS_SIDS ~/bin/servers.arr | awk '{out=$2; for(i=3;i<=NF;i++){out=out" "$i}; print out}'`") # all available SID names declared in servers.arr (key: DPS_SIDS)
+		[[ "${SHOW_ENV_TYPE}" =~ ^(AIF|TUM)$ ]] && declare -a ARCHIVE_ARRAY=("versions")
+		[[ "${SHOW_ENV_TYPE}" == 'QUORUM' ]] && declare -a ARCHIVE_ARRAY=("servers/ES/*/logs")
+
+		STORE_ARRAY='' # reset value to original state			
+		for ARCHIVE_PATH in ${ARCHIVE_ARRAY[@]}; do
+			if [[ ${ARCHIVE_PATH} =~ ^(log|logs)$ ]]; then
+				echo -e "$(colored "34" "INFORMATION") Current destination: ${ARCHIVE_PATH}"
+				STORE_ARRAY+=$(`find ${ARCHIVE_PATH} -mtime +${ARCHIVE}`)
+			else
+				for ARCHIVED_FOLDER in $(find ${SHOW_DEFAULT_PATH}/${ARCHIVE_PATH} -maxdepth 1 -mindepth 1 -type d); do
+					echo -e "$(colored "34" "INFORMATION") Current destination: ${ARCHIVED_FOLDER}"
+					STORE_ARRAY+=$(`find ${ARCHIVED_FOLDER} -mtime +${ARCHIVE}`)
+				done
+			fi
+		done
+
+		ESTIMATED_DISK_SPACE=$(`du -ck ${STORE_ARRAY[@]} | tail -n1 | awk '{print $1}' | sed 's|[^0-9]*||g'`/30)
+		echo "Estimating the necessary approximate disk space for archive: ${ESTIMATED_DISK_SPACE}kB (compression: 30 times)"
+		if [[ `df -kP . | tail -n1 | awk '{print $4}'` -lt ${ESTIMATED_DISK_SPACE} ]]; then
+			echo -e "$(colored "31" "CRITICAL ERROR") Required space: ${ESTIMATED_DISK_SPACE}. Available space: `df -kP . | tail -n1 | awk '{print $4}'`"
+			echo -e "$(colored "31" "CRITICAL ERROR") There is not enough space on the ${IP_ADDRESS} host (free space has to be restored manually)"
+			exit 1
+		fi
+
+		echo -e "$(colored "34" "INFORMATION") Archiving logfiles to $(hostname)_${POSIX_TIME}_${ARCHIVE_PATH,,}_logfiles.tar.gz file (destination: ${SHOW_DEFAULT_PATH}/archived_logfile)"
+		tar -zcf ${SHOW_DEFAULT_PATH}/archived_logfile/$(hostname)_${POSIX_TIME}_${ARCHIVE_PATH,,}_logfiles.tar.gz "${STORE_ARRAY[@]}"
+	fi
+fi

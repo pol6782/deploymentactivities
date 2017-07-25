@@ -1,0 +1,362 @@
+#!/bin/bash -
+# environment refresh automatization tool by adam.chalat@comarch.com
+
+#--------------------------------------------------------------------#
+#---------------------- SECURITY REQUIREMENTS -----------------------#
+#--------------------------------------------------------------------#
+
+# avoid spoofing in the work of the interpreter (additional parameter in header)
+\unalias -a # remove all aliases (starting character \ prevents the use of an alias)
+hash -r # remove all command line path mappings
+ulimit -H -c 0 -- # setting a "hard" limit to 0 prevents memory dumps
+IFS=$' \t\n' # set safe IFS values (syntax for bash and ksh93 shells - not transferable!)
+umask 007 # rights removed from the default setting of access rights
+
+#--------------------------------------------------------------------#
+#---------------------- INITIAL CONFIGURATION -----------------------#
+#--------------------------------------------------------------------#
+
+BUILD_DATE="10.10.2016r."
+SCRIPT_VERSION="0.0.11"
+
+source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common
+
+#--------------------------------------------------------------------#
+#------------------------- HELP FUNCTION ----------------------------#
+#--------------------------------------------------------------------#
+
+if [ -z "$2" ] || [ "$1" = "help" ]; then
+	echo -e "\nEnvironment refresh automatization tool by $(colored "32" "adam.chalat@comarch.com")"
+	echo -e "Vesion: $(colored "35" "${SCRIPT_VERSION}") | Last modification: $(colored "35" "${BUILD_DATE}")\n"
+	echo "This script requires below parameters:"
+	echo "Available parameter [task]: bs_dblinks, bs_sequences, cpm_sequences, crm_dblinks, crm_sequences"
+	echo -e "Available parameter [environment]: `grep ^ENV_LIST ${BIN_PATH}/servers.arr | cut -d"=" -f2`\n"
+	echo -e "Usage: $(colored "34" "refresh_liquibase [task] [environment]")\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#---------------------------- PARAMETERS ----------------------------#
+#--------------------------------------------------------------------#
+
+REFRESH_TYPE=$1
+SERVER_NAME=$2
+
+#--------------------------------------------------------------------#
+#----------------------- CHECK PARAMETERS ---------------------------#
+#--------------------------------------------------------------------#
+
+declare -a SERVER_NAME_ARR=("bs_dblinks" "bs_sequences" "cpm_sequences" "crm_dblinks" "crm_sequences")
+
+if [[ -z $(echo "${SERVER_NAME_ARR[@]:0}" | grep -w $REFRESH_TYPE) ]]; then
+	echo -e "\nWrong parameter. Please see below"
+	echo -e "Available parameters [task]: bs_dblinks, bs_sequences, cpm_sequences, crm_dblinks, crm_sequences\n"
+	exit 1
+fi
+
+#--------------------------------------------------------------------#
+#------------------------------ PATHS -------------------------------#
+#--------------------------------------------------------------------#
+
+DIRECTORY=${BIN_PATH}/server_prepare
+SOURCE_DIR=${SERVER_COMPONENTS}/Refresh_DB
+LIQUIBASE_DIR=${SOURCE_DIR}/Liquibase_Refresh_DB/updates/sql_scripts
+CHANGESET_DIR=${SOURCE_DIR}/Liquibase_Refresh_DB/changeSet
+
+#--------------------------------------------------------------------#
+#---------------------------- VARIABLES -----------------------------#
+#--------------------------------------------------------------------#
+
+INCREMENT="100000"
+
+#--------------------------------------------------------------------#
+#-------------------------- TRAP FUNCTION ---------------------------#
+#--------------------------------------------------------------------#
+
+[ -f ${SOURCE_DIR}/refresh_array.arr ] && ARRAY_RESTORE=(`grep ^${REFRESH_TYPE} ${SOURCE_DIR}/refresh_array.arr`) || ARRAY_RESTORE=()
+
+function CLEANUP() {
+	if [[ ${REFRESH_TYPE} =~ _sequences ]]; then
+		CHECK_FILE=$(grep -w ${REFRESH_TYPE} ${SOURCE_DIR}/refresh_array.arr | wc -l)
+		if [[ $CHECK_FILE = 0 ]]; then
+			echo -e "\nRestoring previously written data to refresh_array.arr: ${ARRAY_RESTORE[@]}"
+			echo ${ARRAY_RESTORE[@]} >> ${SOURCE_DIR}/refresh_array.arr
+			exit
+		else
+			echo -e "\nExiting, because of catched Ctrl+C"
+			exit
+		fi
+	else
+		exit 
+	fi
+}
+
+function RESTORE_ARRAY() {
+	if [[ ${REFRESH_TYPE} =~ _sequences ]]; then
+		echo "Restoring refresh_array.arr because of errors during upgrade"
+		rm ${SOURCE_DIR}/refresh_array.arr
+		mv ${SOURCE_DIR}/refresh_array.arr.backup ${SOURCE_DIR}/refresh_array.arr
+	fi
+}
+
+#Signal errors catching: 0 1 2 3 13 15 - EXIT HUP INT QUIT PIPE TERM
+trap CLEANUP SIGINT SIGTERM
+trap '[ "$?" -eq 1 ] && RESTORE_ARRAY' EXIT
+
+#--------------------------------------------------------------------#
+#-------------------------- READ ARRAY ------------------------------#
+#--------------------------------------------------------------------#
+
+readarray SERVERS_ARRAY < ${BIN_PATH}/servers.arr
+IFS=$'\n'
+SERVERS_ARRAY=( ${SERVERS_ARRAY[@]/\#*/} )
+IFS=' '
+
+[ "${SERVERS_ARRAY[${#SERVERS_ARRAY[@]}-1]}" = " " ] && unset SERVERS_ARRAY[${#SERVERS_ARRAY[@]}-1]
+
+#--------------------------------------------------------------------#
+#----------------------- FUNCTION REMOTE ----------------------------#
+#--------------------------------------------------------------------#
+
+function run_remote_command() {
+	shift
+
+	echo "------------------------------------------------------"
+	echo -e "Server: $(colored "32" "${SERV[2]}") | User: $(colored "32" "${USER}")"
+	echo "------------------------------------------------------"
+	echo -e "Running command: $(colored "35" "$@")"
+	
+	ssh -qo BatchMode=yes ${USER}@${SERV[2]} "bash -l -c '$@'" 2>&1
+	CODE=$?
+	
+	if [ $CODE -ne 0 ]; then
+		echo -e "$(colored "31" "Error code:") $CODE"
+		echo -e "$(colored "31" "Error while executing:") $@"
+		exit 1
+	else
+		echo "${RESULT}"
+	fi
+}
+
+#--------------------------------------------------------------------#
+#------------------------- SEQUENCES UPDATE -------------------------#
+#--------------------------------------------------------------------#
+
+if [[ ${REFRESH_TYPE} =~ crm_ ]]; then
+	ENV_NAME=CRM
+	RHOME=`grep "$SERVER_NAME" ${BIN_PATH}/servers.arr | grep CRM | head -n1 | awk '{ print $6 }'`
+	SEQUENCE=("CDM_ACCOUNTS_S" "TT_TASKS_S" "TT_CASES" "OM_ORDERS_TG_UNIQUE_SYMBOL" "SM_AGREEMENTS_S")
+	COLUMN=("CRM Account ID" "CRM Task ID" "CRM Case ID" "CRM Order ID" "CRM Service Agrm ID")
+	FILES=("CDM_ACCOUNTS_S.sql" "TT_TASKS_S.sql" "TT_CASES_S.sql" "OM_ORDERS_TG_UNIQUE_SYMBOL.sql" "SM_AGREEMENTS_S.sql")
+elif [[ ${REFRESH_TYPE} =~ bs_ ]]; then
+	ENV_NAME=CPM
+	RHOME=`grep "$SERVER_NAME" ${BIN_PATH}/servers.arr | grep CPM | head -n1 | awk '{ print $6 }'`
+	SEQUENCE=("BS.TCOMNUMCOUNTERS")
+	COLUMN=("BS Invoice Numbe")
+	FILES=("BS.TCOMNUMCOUNTERS.sql")
+elif [[ ${REFRESH_TYPE} =~ cpm_ ]]; then
+	ENV_NAME=CPM
+	RHOME=`grep "$SERVER_NAME" ${BIN_PATH}/servers.arr | grep CPM | head -n1 | awk '{ print $6 }'`
+	SEQUENCE=("ConnectionID")
+	COLUMN=("CPM sequence")
+	FILES=("setSequences.sh")
+fi
+
+#--------------------------------------------------------------------#
+#---------------------------- FUNCTIONS -----------------------------#
+#--------------------------------------------------------------------#
+
+function RESTORE() {
+	echo "Restoring files to initial state"
+	cd ${SOURCE_DIR}/Liquibase_Refresh_DB; rm -rf *
+	cp -R ${SOURCE_DIR}/Source/Liquibase_backup/Liquibase_Refresh_DB ${SOURCE_DIR}/
+}
+
+function FILES_CHANGE() {
+	echo -e "Writing changes to file $(colored "34" "${FILES[i]}")"
+	if [[ ${REFRESH_TYPE} =~ crm_ ]] || [[ ${REFRESH_TYPE} =~ bs_ ]]; then
+		sed "s/modify_value/$CDM_ACCOUNTS_S/g" ${SOURCE_DIR}/Source/Liquibase_backup/DB_scripts/${FILES[i]} > ${LIQUIBASE_DIR}/${FILES[i]}
+		sed -i "0,/<\/comment>/s//<\/comment>\n<sqlFile path=\"updates\/sql_scripts\/${FILES[i]}\" splitStatements=\"false\"\/>/" ${CHANGESET_DIR}/Refresh_Database.xml
+	elif [[ ${REFRESH_TYPE} =~ cpm_ ]]; then
+		sed -i "s/SEQUENCE=\".*\"/SEQUENCE=\"$CDM_ACCOUNTS_S\"/g" ${SOURCE_DIR}/Source/Refresh_DBLinks_Paths/${SERVER_NAME}/setSequences.sh
+	fi
+}
+
+function SEQUENCES() {
+	ARRAY=()
+	[ -f ${SOURCE_DIR}/refresh_array.arr ] && ARRAY=(`grep ^${REFRESH_TYPE} ${SOURCE_DIR}/refresh_array.arr`)
+
+	if [ ${ARRAY} ]; then
+		cd /data/das/bin/server_prepare
+		sed -i.backup "s|^$ARRAY|backup_${SERVER_NAME}_${INCREMENT}_`date`_$ARRAY|g" ${SOURCE_DIR}/refresh_array.arr
+
+		if [ $(( ${#ARRAY[@]} - 1 )) != ${#SEQUENCE[@]} ]; then
+			echo "The length of the SEQUENCES and ARRAY matrix does not agree."
+			echo "Please check the $SOURCE_DIR/refresh_array.arr file. Exiting."
+			exit 1
+		fi
+	fi
+
+	echo "Cleaning liquibase directory"
+	cd ${LIQUIBASE_DIR}; rm -f *
+
+	for ((i=0;i<${#SEQUENCE[@]};++i)); do
+		if [ -z ${ARRAY[i+1]} ]; then
+			echo -e "Please register initial value of $(colored "32" "${SEQUENCE[i]}")"
+			read CDM_ACCOUNTS_S
+			FILES_CHANGE
+		else
+			echo -e "Fetching value of $(colored "32" "${SEQUENCE[i]}") sequence from sequences (column ${COLUMN[i]}): $(colored "35" "${ARRAY[i+1]}")"
+			echo "Adding increase refresh value: ${INCREMENT}"
+			CDM_ACCOUNTS_S=$(( ${ARRAY[i+1]} + ${INCREMENT} ))
+			FILES_CHANGE
+		fi
+
+		ARRAY_NEW+=($CDM_ACCOUNTS_S)
+	done
+
+	echo ${REFRESH_TYPE} ${ARRAY_NEW[@]} >> ${SOURCE_DIR}/refresh_array.arr
+	sed -i "s|context=\".*-context\"|context=\"refresh-sequences-context\"|g" ${SOURCE_DIR}/Liquibase_Refresh_DB/changeSet/Refresh_Database.xml
+}
+
+function DBLINKS() {
+	echo "Cleaning liquibase directory"
+	cd ${LIQUIBASE_DIR}; rm -f *
+
+	#Creating array of files for dblinks update
+	cd ${SOURCE_DIR}/Source/Refresh_DBLinks_Paths/${SERVER_NAME}
+	if [[ ${REFRESH_TYPE} =~ crm_ ]]; then
+		DB_FILES=($(ls -r ${SERVER_NAME}_CRM_*))
+	elif [[ ${REFRESH_TYPE} =~ bs_ ]]; then
+		DB_FILES=($(ls -r ${SERVER_NAME}_BS_*))
+	fi
+
+	IFS=$'\n'
+	DB_FILES=( ${DB_FILES[@]/\#*/} )
+	IFS=' '
+
+	function SED_FUNCTION() {
+		if [[ ${REFRESH_TYPE} =~ crm_ ]]; then
+			SED_OPERATION=`sed -i "0,/<\/comment>/s//<\/comment>\n<sqlFile path=\"updates\/sql_scripts\/${DB_FILES[i]}\" splitStatements=\"false\"\/>/" ${CHANGESET_DIR}/Refresh_Database.xml`
+		elif [[ ${REFRESH_TYPE} =~ bs_ ]]; then
+			SED_OPERATION=`sed -i "0,/<\/comment>/s//<\/comment>\n<sqlFile path=\"updates\/sql_scripts\/${DB_FILES[i]}\" splitStatements=\"true\" endDelimiter=\"\/--delimiter\"\/>/" ${CHANGESET_DIR}/Refresh_Database.xml`
+		fi
+	}
+
+	for ((i=0;i<${#DB_FILES[@]};++i)); do
+		echo "Writing changes to liquibase directory. File: ${DB_FILES[i]}"
+		cp ${DB_FILES[i]} ${LIQUIBASE_DIR}
+		SED_FUNCTION
+	done
+
+	sed -i "s|context=\".*-context\"|context=\"refresh-dblinks-context\"|g" ${SOURCE_DIR}/Liquibase_Refresh_DB/changeSet/Refresh_Database.xml
+}
+
+function CREATE_LIQUIBASE() {
+	echo "Preparing liquibase for environment refresh"
+	cd ${SOURCE_DIR}; rm DB_Liquibase.zip
+	zip -r ${SOURCE_DIR}/DB_Liquibase.zip ./Liquibase_Refresh_DB/
+
+	echo "Preparing ${ENV_NAME}_db_refresh.sh script"
+	sed -i "s|LBU_HOME=.*|LBU_HOME=\"${RHOME}/liquibase\"|" ${SOURCE_DIR}/Source/${ENV_NAME}_db_refresh.sh
+
+	#Preparing ${ENV_NAME}_db_refresh.sh script
+	[[ ${REFRESH_TYPE} =~ _sequences ]] && SED_VARIABLE=refresh-sequences-context || SED_VARIABLE=refresh-dblinks-context
+	SED_OPERATION=$(sed -i "s|./bin/ant\ refresh-.*|./bin/ant\ $SED_VARIABLE\ -Dupgrade.version=environment_refresh\ -Dcontext=$SED_VARIABLE\ -Dfile.encoding=UTF8\ 2>\&1\ \|\ tee\ -a\ \$LB_LOGS/environment_refresh-\$TIME_FILE.log|g" ${SOURCE_DIR}/Source/${ENV_NAME}_db_refresh.sh)
+}
+
+function COPY_TO_SERVER() {
+	echo "Environment refresh liquibase upgrade"
+	echo "Making directories"
+	run_remote_command ${SERV[2]} "mkdir -p ${SERVERS_PATH}/utilities/Logs"
+
+	echo "Environment refresh liquibase changeset copy"
+	echo "Destination directory: ${SERVERS_PATH}/utilities"
+	RESULT=$(scp DB_Liquibase.zip ${USER}@${SERV[2]}:${SERVERS_PATH}/utilities 2>&1); CODE1=$?
+	RESULT=$(scp ${SOURCE_DIR}/Source/${ENV_NAME}_db_refresh.sh ${USER}@${SERV[2]}:${SERVERS_PATH}/utilities 2>&1); CODE2=$?
+	RESULT=$(scp ${SOURCE_DIR}/Source/Configuration_files/${ENV_NAME}/build.xml ${USER}@${SERV[2]}:${SERVERS_PATH} 2>&1); CODE3=$?
+	if [ $CODE1 -ne 0 ] || [ $CODE2 -ne 0 ] || [ $CODE3 -ne 0 ]; then
+		echo "Error code: $CODE"
+		echo "${RESULT}"
+		exit 1
+	fi
+	echo "Environment refresh liquibase changeset copied successfully"
+
+	echo "Adding execute permissions for ${ENV_NAME}_db_refresh.sh script"
+	run_remote_command ${SERV[2]} "chmod 764 ${SERVERS_PATH}/utilities/${ENV_NAME}_db_refresh.sh"
+	run_remote_command ${SERV[2]} "cd ${SERVERS_PATH}/utilities; if [ -d ./Refresh_DB ]; then rm -r ./Refresh_DB; fi"
+}
+
+function ABORT_CHECK() {
+	read -p "Proceed with refresh: ${REFRESH_TYPE} update on ${SERVER_NAME} environment?" -n 1 -r
+	if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+		echo -e "\nAborting environment refresh, because of user input. Exiting."
+		exit 1
+	fi
+}
+
+function LIQUIBASE_UPGRADE() {
+	echo "Environment refresh liquibase changeset unpacking"
+	run_remote_command ${SERV[2]} "unzip -o ${SERVERS_PATH}/utilities/DB_Liquibase.zip -d ${SERVERS_PATH}/utilities/"
+
+	ABORT_CHECK
+	echo -e "\nExecuting environment refresh - ${REFRESH_TYPE} on ${SERVER_NAME}"
+	run_remote_command ${SERV[2]} "cd ${SERVERS_PATH}/utilities; ./${ENV_NAME}_db_refresh.sh"
+}
+
+function CPM_SEQUENCES() {
+	echo "Environment refresh: CPM sequences update script"
+	echo "Making directories"
+	run_remote_command ${SERV[2]} "mkdir -p ${SERVERS_PATH}/utilities"
+
+	cd ${SOURCE_DIR}/Source/Refresh_DBLinks_Paths/${SERVER_NAME}
+	echo "Destination directory: ${SERVERS_PATH}/utilities"
+	RESULT=$(scp setSequences.sh ${USER}@${SERV[2]}:${SERVERS_PATH}/utilities 2>&1)
+	CODE=$?
+	if [ $CODE -ne 0 ]; then
+		echo "Error code: $CODE"
+		echo "${RESULT}"
+		exit 1
+	fi
+	echo "Environment refresh: CPM sequences update script copied successfully"
+
+	echo "Adding execute permissions for setSequences.sh"
+	run_remote_command ${SERV[2]} "chmod 764 ${SERVERS_PATH}/utilities/setSequences.sh"
+
+	ABORT_CHECK
+	echo -e "\nExecuting environment refresh - ${REFRESH_TYPE} on ${SERVER_NAME}"
+	run_remote_command ${SERV[2]} "${SERVERS_PATH}/utilities/setSequences.sh"
+}
+
+#--------------------------------------------------------------------#
+#------------------------- FUNCTIONS CALLS --------------------------#
+#--------------------------------------------------------------------#
+
+if [[ ${REFRESH_TYPE} =~ crm_ ]] || [[ ${REFRESH_TYPE} =~ bs_ ]]; then
+	RESTORE
+	if [ ${REFRESH_TYPE} = 'crm_sequences' ] || [ ${REFRESH_TYPE} = 'bs_sequences' ]; then
+		SEQUENCES
+	elif [ ${REFRESH_TYPE} = 'crm_dblinks' ] || [ ${REFRESH_TYPE} = 'bs_dblinks' ]; then
+		DBLINKS
+	fi
+	CREATE_LIQUIBASE
+fi
+
+for SERVER in "${SERVERS_ARRAY[@]}"; do
+	SERV=($SERVER)
+	if [ "${SERV[0]}" = "$SERVER_NAME" -a "${SERV[1]}" = "${ENV_NAME}" ]; then
+		if [ "${SERV[3]}" = "1" ]; then
+			USER="${SERV[4]}"
+
+			cd ${SOURCE_DIR}
+			SERVERS_PATH=${RHOME}/liquibase
+			if [ ${REFRESH_TYPE} = 'cpm_sequences' ]; then
+				SEQUENCES
+				CPM_SEQUENCES
+			else
+				COPY_TO_SERVER
+				LIQUIBASE_UPGRADE
+			fi
+		fi
+	fi
+done
